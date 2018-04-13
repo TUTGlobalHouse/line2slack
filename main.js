@@ -3,12 +3,41 @@ const Router = require('koa-router')
 const koaBody = require('koa-body')
 const crypto = require("crypto")
 const request = require('request')
+const querystring = require('querystring')
+const line = require('@line/bot-sdk')
 
 const app = new Koa()
 const router = new Router()
 
-const validate_signature = (signature, json) => {
-  return signature == crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET).update(new Buffer(json, 'utf8')).digest('base64')
+const validate_signature = (headers, body) => {
+  const {'x-line-signature': signature} = headers
+  const channelSecret = process.env.LINE_CHANNEL_SECRET
+  return line.validateSignature(body, channelSecret, signature)
+}
+
+const getAccessToken = () => {
+  const headers = {
+    'Content-type': 'application/x-www-form-urlencoded'
+  }
+  const dataString = querystring.stringify({
+    grant_type: 'client_credentials',
+    client_id: process.env.LINE_CHANNEL_ID,
+    client_secret: process.env.LINE_CHANNEL_SECRET,
+  })
+  const options = {
+    url: 'https://api.line.me/v2/oauth/accessToken',
+    method: 'POST',
+    headers: headers,
+    body: dataString
+  }
+
+  return new Promise(resolve => {
+    request(options, (error, response, body) => {
+      if (!error) {
+        resolve(JSON.parse(body))
+      }
+    })
+  })
 }
 
 const postToSlack = ({ text }) => {
@@ -30,27 +59,38 @@ const postToSlack = ({ text }) => {
   })
 }
 
-router.post('/callback', koaBody(),
-  (ctx) => {
-    console.log(ctx.request.headers['x-line-signature'])
-    ctx.body = JSON.stringify(ctx.request.body)
-    console.log(ctx.body)
-    if (!validate_signature(ctx.headers['x-line-signature'], ctx.body)) return
-    const event = ctx.request.body['events'][0]
-    if (event['type'] == 'message') {
-      const message = event['message']
-      if (message['type'] == 'text') {
-        const source = event['source']
-        const userId = source['userId'] // TODO const userName = fetchUserNamebyId(userId)
-        const groupId = source['groupId']
-        if (groupId != process.env.LINE_GROUP_ID) return
-        postToSlack({text: message.text})
+const main = async () => {
+  const { access_token: accessToken } = await getAccessToken()
+
+  const config = {
+    channelAccessToken: accessToken,
+    channelSecret: process.env.LINE_CHANNEL_SECRET
+  }
+
+  const client = new line.Client(config) 
+  router.post('/callback', koaBody(),
+    async (ctx) => {
+      ctx.body = JSON.stringify(ctx.request.body)
+      if (!validate_signature(ctx.headers, ctx.body)) return
+      const event = ctx.request.body['events'][0]
+      if (event['type'] == 'message') {
+        const message = event['message']
+        if (message['type'] == 'text') {
+          const source = event['source']
+          const userId = source['userId']
+          const groupId = source['groupId']
+          if (groupId != process.env.LINE_GROUP_ID) return
+          const { displayName, pictureUrl } = await client.getProfile(userId)
+          postToSlack({text: `*${displayName}*\n>>>${message.text}`})
+        }
       }
     }
-  }
-)
+  )
 
-app.use(router.routes())
-  .use(router.allowedMethods())
+  app.use(router.routes())
+    .use(router.allowedMethods())
 
-app.listen(process.env.PORT || 3000)
+  app.listen(process.env.PORT || 3000)
+}
+
+main().then(() => {})
